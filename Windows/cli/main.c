@@ -17,8 +17,8 @@
 
 
 #define VERSION "4.0.13-Beta"
-#define MAX_PROXY_CONFIGS 16
-#define MAX_RULES         256
+#define MAX_PROXY_CONFIGS 256
+#define MAX_RULES         512
 
 
 typedef uint32_t (*pfnAddProxyConfig)(int type, const char* ip, uint16_t port,
@@ -855,7 +855,7 @@ int main(int argc, char* argv[])
 
     // ── Load profile ──────────────────────────────────────────────────────────
     printf("Loading profile: %s\n", profile_path);
-    PBProfile prof;
+    static PBProfile prof;   // static: with 256 configs the profile is too big for the stack
     if (!load_profile(profile_path, &prof))
         return 1;
 

@@ -2,6 +2,12 @@
 
 // Rules: IP/port/domain/process matching and the rule-management API.
 
+// Owner (user name) of the process whose connection is being matched right now.
+// Set by check_process_rule*() around match_rule*() so that "@user" process patterns
+// can match by account: "@worker001" = any program run by worker001. Thread-local,
+// so rule matching from any other thread simply sees no owner.
+static __declspec(thread) const char *t_match_owner = NULL;
+
 BOOL is_ipv6_multicast_or_linklocal(const UINT8 ip6[16])
 {
     // Multicast: FF00::/8  (IPv6 has no broadcast; multicast replaces it)
@@ -31,8 +37,11 @@ RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const
     if (!get_process_name_from_pid(pid, process_name, sizeof(process_name)))
         return RULE_ACTION_DIRECT;
 
+    char owner[256];
+    t_match_owner = get_process_owner_from_pid(pid, owner, sizeof(owner)) ? owner : NULL;
     UINT32 proxy_config_id = 0;
     RuleAction action = match_rule_v6(process_name, dest_ip6, dest_port, is_udp, &proxy_config_id);
+    t_match_owner = NULL;
 
     if (action == RULE_ACTION_PROXY)
     {
@@ -294,6 +303,10 @@ BOOL match_process_pattern(const char *pattern, const char *process_full_path)
 {
     if (pattern == NULL || strcmp(pattern, "*") == 0)
         return TRUE;
+
+    // "@user" / "@worker*": match by the account that owns the process
+    if (pattern[0] == '@')
+        return t_match_owner != NULL && t_match_owner[0] != '\0' && wildcard_match(pattern + 1, t_match_owner);
 
     // Extract just the filename from the full path for comparison
     // Windows path sucks
@@ -735,8 +748,11 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
         return RULE_ACTION_DIRECT;
 
     // Use unified rule matching function
+    char owner[256];
+    t_match_owner = get_process_owner_from_pid(pid, owner, sizeof(owner)) ? owner : NULL;
     UINT32 proxy_config_id = 0;
     RuleAction action = match_rule(process_name, dest_ip, dest_port, is_udp, &proxy_config_id);
+    t_match_owner = NULL;
 
     // Additional checks for proxy configuration
     if (action == RULE_ACTION_PROXY)

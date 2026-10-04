@@ -1,5 +1,7 @@
 #include "pb_internal.h"
 
+#pragma comment(lib, "advapi32.lib")
+
 // Process resolution: src-port -> PID lookups and the PID cache.
 
 // Reusable grow-only scratch buffer for the TCP/UDP owner-PID tables. These lookups run
@@ -220,6 +222,63 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size)
 
     CloseHandle(hProcess);
     return FALSE;
+}
+
+// Owner (user account name, without domain) of a process, for "@user" rules on
+// multi-user machines (Remote Desktop Services: one rule/proxy per logged-on user).
+// Looked up only on the single packet-processor thread, so the small PID cache below
+// needs no lock. Entries expire so a recycled PID can't keep a stale owner for long.
+#define OWNER_CACHE_SIZE 256
+#define OWNER_CACHE_TTL_MS 30000
+typedef struct {
+    DWORD pid;
+    ULONGLONG timestamp;
+    char owner[256];
+} OWNER_CACHE_ENTRY;
+static OWNER_CACHE_ENTRY g_owner_cache[OWNER_CACHE_SIZE];
+
+BOOL get_process_owner_from_pid(DWORD pid, char *name, DWORD name_size)
+{
+    if (pid == 0 || pid == 4)
+        return FALSE;
+
+    ULONGLONG now = GetTickCount64();
+    OWNER_CACHE_ENTRY *slot = &g_owner_cache[pid % OWNER_CACHE_SIZE];
+    if (slot->pid == pid && now - slot->timestamp < OWNER_CACHE_TTL_MS)
+    {
+        strncpy_s(name, name_size, slot->owner, _TRUNCATE);
+        return name[0] != '\0';
+    }
+
+    BOOL ok = FALSE;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess == NULL)
+        return FALSE;
+
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken))
+    {
+        BYTE buf[256];
+        DWORD len = 0;
+        if (GetTokenInformation(hToken, TokenUser, buf, sizeof(buf), &len))
+        {
+            WCHAR user_w[256], domain_w[256];
+            DWORD user_len = 256, domain_len = 256;
+            SID_NAME_USE use;
+            if (LookupAccountSidW(NULL, ((TOKEN_USER *)buf)->User.Sid, user_w, &user_len, domain_w, &domain_len, &use))
+                ok = WideCharToMultiByte(CP_UTF8, 0, user_w, -1, name, (int)name_size, NULL, NULL) > 0;
+        }
+        CloseHandle(hToken);
+    }
+    CloseHandle(hProcess);
+
+    slot->pid = pid;
+    slot->timestamp = now;
+    if (ok)
+        strncpy_s(slot->owner, sizeof(slot->owner), name, _TRUNCATE);
+    else
+        slot->owner[0] = '\0';
+    return ok;
 }
 
 //  cache pid

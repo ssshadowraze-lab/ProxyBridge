@@ -258,6 +258,7 @@ DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port);
 DWORD get_process_id_from_connection_v6(const UINT8 src_ip6[16], UINT16 src_port);
 DWORD get_process_id_from_udp_connection_v6(const UINT8 src_ip6[16], UINT16 src_port);
 BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size);
+BOOL get_process_owner_from_pid(DWORD pid, char *name, DWORD name_size);
 UINT32 pid_cache_hash(UINT32 src_ip, UINT16 src_port, BOOL is_udp);
 DWORD get_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp);
 void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp);
