@@ -877,6 +877,12 @@ static void do_update(void)
 // ── main ──────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[])
 {
+    // Unbuffered stdout/stderr: this is a long-running headless process, so block
+    // buffering would otherwise swallow --verbose log lines (and hot-reload
+    // notifications) until the buffer filled or the process exited.
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     bool do_upd       = false;
     char profile_path[MAX_PATH] = {0};
 
