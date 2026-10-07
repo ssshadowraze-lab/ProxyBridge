@@ -29,6 +29,14 @@ typedef uint32_t (*pfnAddRule)(const char* process, const char* hosts,
                                int protocol, int action,
                                uint32_t config_id);
 typedef int  (*pfnDisableRule)(uint32_t rule_id);
+typedef int  (*pfnEnableRule)(uint32_t rule_id);
+typedef int  (*pfnEditProxyConfig)(uint32_t id, int type, const char* ip, uint16_t port,
+                                   const char* user, const char* pass, int send_domain);
+typedef int  (*pfnDeleteProxyConfig)(uint32_t id);
+typedef int  (*pfnEditRule)(uint32_t rule_id, const char* process, const char* hosts,
+                            const char* ports, const char* domains,
+                            int protocol, int action, uint32_t config_id);
+typedef int  (*pfnDeleteRule)(uint32_t rule_id);
 typedef void (*pfnSetLogCallback)(void (*cb)(const char*));
 typedef void (*pfnSetConnectionCallback)(void (*cb)(const char*, DWORD,
                                           const char*, uint16_t, const char*));
@@ -40,6 +48,11 @@ typedef int  (*pfnStop)(void);
 static pfnAddProxyConfig        g_AddProxyConfig = NULL;
 static pfnAddRule               g_AddRule        = NULL;
 static pfnDisableRule           g_DisableRule    = NULL;
+static pfnEnableRule            g_EnableRule     = NULL;
+static pfnEditProxyConfig       g_EditProxyConfig = NULL;
+static pfnDeleteProxyConfig     g_DeleteProxyConfig = NULL;
+static pfnEditRule              g_EditRule       = NULL;
+static pfnDeleteRule            g_DeleteRule     = NULL;
 static pfnSetLogCallback        g_SetLog         = NULL;
 static pfnSetConnectionCallback g_SetConn        = NULL;
 static pfnSetLocalhostViaProxy  g_SetLocalhost   = NULL;
@@ -79,22 +92,34 @@ typedef struct {
     int         num_rules;
 } PBProfile;
 
-// Maps a profile's "Id" to the id the DLL assigned when the config was added.
-typedef struct { uint32_t profile_id; uint32_t dll_id; } IdMap;
-
 // Globals
 static volatile LONG g_running = 0;
 static int           g_verbose = 0;
 
 // ── Hot-reload state ──────────────────────────────────────────────────────────
-// What has already been pushed into the running engine, so that when the profile
-// file changes we only ADD the new proxy configs / rules (e.g. a freshly onboarded
-// worker) instead of restarting the whole bridge and tearing down everyone's
-// live connections. Keyed by profile config "Id" and by rule ProcessName.
-static IdMap g_id_map[MAX_PROXY_CONFIGS];
-static int   g_id_map_n = 0;
-static char  g_applied_rule[MAX_RULES][256];
-static int   g_applied_rule_n = 0;
+// Snapshot of what is currently live in the engine, so that when the profile file
+// changes we can diff it and apply ONLY the delta - add new workers, edit changed
+// proxies/rules (e.g. a rotated password) and delete removed ones - all without
+// restarting the bridge and tearing down everyone else's live connections.
+// Configs are keyed by the profile's "Id"; rules by their ProcessName (e.g.
+// "@worker011"), which is this deployment's one-rule-per-worker identity.
+typedef struct {
+    uint32_t profile_id;          // "Id" from the profile
+    uint32_t dll_id;              // id the engine assigned
+    PBProxyConfig snap;           // last-applied content (to detect edits)
+    int      seen;                // marked while diffing a reload
+} AppliedConfig;
+
+typedef struct {
+    uint32_t dll_id;              // rule id the engine assigned
+    PBRule   snap;                // last-applied content (process_name is the key)
+    int      seen;
+} AppliedRule;
+
+static AppliedConfig g_cfg[MAX_PROXY_CONFIGS];
+static int           g_cfg_n = 0;
+static AppliedRule   g_rule[MAX_RULES];
+static int           g_rule_n = 0;
 
 // Callbacks
 static void log_cb(const char* msg)
@@ -416,99 +441,185 @@ static bool load_profile(const char* path, PBProfile* prof)
     return true;
 }
 
-// ── Apply a parsed profile to the running engine (add-only) ───────────────────
-// Pushes any proxy configs / rules that are not already live. On the first call
-// (initial==true) this loads the whole profile; on later calls (triggered by the
-// profile file changing on disk) it only adds the new entries, so onboarding a
-// worker mid-day never restarts the bridge or drops anyone else's connections.
-// Returns the number of new entries (configs + rules) that were added.
+// ── Sync a parsed profile into the running engine (add / edit / delete) ───────
+// On the first call this loads the whole profile. On later calls (the profile
+// file changed on disk) it diffs against what is already live and applies only
+// the delta: new workers are added, changed proxies/rules are edited in place
+// (e.g. a rotated SOCKS password), and removed ones are deleted - all without
+// restarting the bridge, so everyone else's live connections are untouched.
+// Returns the number of changes (adds + edits + deletes) applied.
 static uint32_t resolve_dll_cfg_id(uint32_t profile_cfg_id)
 {
-    for (int j = 0; j < g_id_map_n; j++)
-        if (g_id_map[j].profile_id == profile_cfg_id)
-            return g_id_map[j].dll_id;
-    return (g_id_map_n > 0) ? g_id_map[0].dll_id : 0;  // fallback: first config
+    for (int j = 0; j < g_cfg_n; j++)
+        if (g_cfg[j].profile_id == profile_cfg_id)
+            return g_cfg[j].dll_id;
+    return (g_cfg_n > 0) ? g_cfg[0].dll_id : 0;   // fallback: first config
 }
 
-static bool rule_already_applied(const char* process_name)
+static bool config_differs(const PBProxyConfig* a, const PBProxyConfig* b)
 {
-    for (int i = 0; i < g_applied_rule_n; i++)
-        if (strcmp(g_applied_rule[i], process_name) == 0)
-            return true;
-    return false;
+    return a->type != b->type || a->port != b->port ||
+           a->send_domain_to_proxy != b->send_domain_to_proxy ||
+           strcmp(a->host, b->host)         != 0 ||
+           strcmp(a->username, b->username) != 0 ||
+           strcmp(a->password, b->password) != 0;
 }
 
-static int apply_profile(const PBProfile* prof, bool initial)
+static bool rule_differs(const PBRule* a, const PBRule* b)
 {
-    int added = 0;
+    return a->protocol != b->protocol || a->action != b->action ||
+           a->is_enabled != b->is_enabled || a->proxy_config_id != b->proxy_config_id ||
+           strcmp(a->target_hosts,   b->target_hosts)   != 0 ||
+           strcmp(a->target_ports,   b->target_ports)   != 0 ||
+           strcmp(a->target_domains, b->target_domains) != 0;
+}
 
-    // ── New proxy configs (dedup by profile "Id") ────────────────────────────
+static const char* action_name(int a)
+{
+    return a == 0 ? "PROXY" : (a == 1 ? "DIRECT" : "BLOCK");
+}
+
+static int sync_profile(const PBProfile* prof, bool initial)
+{
+    const char* tag = initial ? "[+]" : "[hot]";
+    int changes = 0;
+
+    for (int i = 0; i < g_cfg_n;  i++) g_cfg[i].seen  = 0;
+    for (int i = 0; i < g_rule_n; i++) g_rule[i].seen = 0;
+
+    // ── Proxy configs: add new, edit changed (keyed by profile "Id") ─────────
     for (int i = 0; i < prof->num_configs; i++)
     {
         const PBProxyConfig* c = &prof->configs[i];
 
-        bool known = false;
-        for (int j = 0; j < g_id_map_n; j++)
-            if (g_id_map[j].profile_id == c->profile_id) { known = true; break; }
-        if (known) continue;
+        int idx = -1;
+        for (int j = 0; j < g_cfg_n; j++)
+            if (g_cfg[j].profile_id == c->profile_id) { idx = j; break; }
 
-        uint32_t did = g_AddProxyConfig(c->type, c->host, (uint16_t)c->port,
-                                        c->username, c->password, c->send_domain_to_proxy);
-        if (did == 0)
+        if (idx < 0)   // new config
         {
-            fprintf(stderr, "  ERROR: failed to add proxy config id=%u (%s:%d)\n",
-                    c->profile_id, c->host, c->port);
-            continue;
+            uint32_t did = g_AddProxyConfig(c->type, c->host, (uint16_t)c->port,
+                                            c->username, c->password, c->send_domain_to_proxy);
+            if (did == 0)
+            {
+                fprintf(stderr, "  ERROR: add proxy config id=%u (%s:%d) failed\n",
+                        c->profile_id, c->host, c->port);
+                continue;
+            }
+            if (g_cfg_n < MAX_PROXY_CONFIGS)
+            {
+                g_cfg[g_cfg_n].profile_id = c->profile_id;
+                g_cfg[g_cfg_n].dll_id     = did;
+                g_cfg[g_cfg_n].snap       = *c;
+                g_cfg[g_cfg_n].seen       = 1;
+                g_cfg_n++;
+            }
+            changes++;
+            printf("  %s add  config id=%u  %s  %s:%d\n", tag,
+                   c->profile_id, c->type ? "SOCKS5" : "HTTP", c->host, c->port);
         }
-        if (g_id_map_n < MAX_PROXY_CONFIGS)
+        else           // existing config - edit if changed
         {
-            g_id_map[g_id_map_n].profile_id = c->profile_id;
-            g_id_map[g_id_map_n].dll_id     = did;
-            g_id_map_n++;
+            g_cfg[idx].seen = 1;
+            if (config_differs(&g_cfg[idx].snap, c))
+            {
+                if (g_EditProxyConfig(g_cfg[idx].dll_id, c->type, c->host, (uint16_t)c->port,
+                                      c->username, c->password, c->send_domain_to_proxy))
+                {
+                    g_cfg[idx].snap = *c;
+                    changes++;
+                    printf("  %s edit config id=%u  %s:%d\n", tag,
+                           c->profile_id, c->host, c->port);
+                }
+                else
+                    fprintf(stderr, "  WARNING: edit proxy config id=%u failed\n", c->profile_id);
+            }
         }
-        added++;
-        printf("  %s proxy config id=%u  %s  %s:%d  (dll id=%u)\n",
-               initial ? "[+]" : "[hot-add]",
-               c->profile_id, c->type ? "SOCKS5" : "HTTP",
-               c->host, c->port, did);
     }
 
-    // ── New rules (dedup by ProcessName, e.g. "@worker011") ──────────────────
+    // ── Rules: add new, edit changed (keyed by ProcessName) ──────────────────
     for (int i = 0; i < prof->num_rules; i++)
     {
-        const PBRule* r    = &prof->rules[i];
-        const char*   proc = r->process_name[0]   ? r->process_name   : "*";
-        if (rule_already_applied(proc)) continue;
+        // Normalise so stored snapshot == what we actually push (defaults applied).
+        PBRule nr = prof->rules[i];
+        if (!nr.process_name[0])   strncpy_s(nr.process_name,   sizeof(nr.process_name),   "*", _TRUNCATE);
+        if (!nr.target_hosts[0])   strncpy_s(nr.target_hosts,   sizeof(nr.target_hosts),   "*", _TRUNCATE);
+        if (!nr.target_ports[0])   strncpy_s(nr.target_ports,   sizeof(nr.target_ports),   "*", _TRUNCATE);
+        if (!nr.target_domains[0]) strncpy_s(nr.target_domains, sizeof(nr.target_domains), "*", _TRUNCATE);
 
-        uint32_t dll_cfg_id = 0;
-        if (r->action == 0)                       // PROXY action needs a config
-            dll_cfg_id = resolve_dll_cfg_id(r->proxy_config_id);
+        uint32_t dll_cfg_id = (nr.action == 0) ? resolve_dll_cfg_id(nr.proxy_config_id) : 0;
 
-        const char* hosts   = r->target_hosts[0]   ? r->target_hosts   : "*";
-        const char* ports   = r->target_ports[0]   ? r->target_ports   : "*";
-        const char* domains = r->target_domains[0] ? r->target_domains : "*";
+        int idx = -1;
+        for (int j = 0; j < g_rule_n; j++)
+            if (strcmp(g_rule[j].snap.process_name, nr.process_name) == 0) { idx = j; break; }
 
-        uint32_t rid = g_AddRule(proc, hosts, ports, domains,
-                                 r->protocol, r->action, dll_cfg_id);
-        if (rid == 0)
+        if (idx < 0)   // new rule
         {
-            fprintf(stderr, "  WARNING: failed to add rule (%s)\n", proc);
-            continue;
+            uint32_t rid = g_AddRule(nr.process_name, nr.target_hosts, nr.target_ports,
+                                     nr.target_domains, nr.protocol, nr.action, dll_cfg_id);
+            if (rid == 0)
+            {
+                fprintf(stderr, "  WARNING: add rule (%s) failed\n", nr.process_name);
+                continue;
+            }
+            if (!nr.is_enabled) g_DisableRule(rid);
+            if (g_rule_n < MAX_RULES)
+            {
+                g_rule[g_rule_n].dll_id = rid;
+                g_rule[g_rule_n].snap   = nr;
+                g_rule[g_rule_n].seen   = 1;
+                g_rule_n++;
+            }
+            changes++;
+            printf("  %s add  rule %-26s cfg=%u  %s%s\n", tag,
+                   nr.process_name, nr.proxy_config_id, action_name(nr.action),
+                   nr.is_enabled ? "" : "  [disabled]");
         }
-        if (!r->is_enabled)
-            g_DisableRule(rid);
-
-        if (g_applied_rule_n < MAX_RULES)
-            strncpy_s(g_applied_rule[g_applied_rule_n++], 256, proc, _TRUNCATE);
-        added++;
-        printf("  %s rule %-28s cfg=%u  %s%s\n",
-               initial ? "[+]" : "[hot-add]",
-               proc, r->proxy_config_id,
-               r->action == 0 ? "PROXY" : (r->action == 1 ? "DIRECT" : "BLOCK"),
-               r->is_enabled ? "" : "  [disabled]");
+        else           // existing rule - edit if changed
+        {
+            g_rule[idx].seen = 1;
+            if (rule_differs(&g_rule[idx].snap, &nr))
+            {
+                if (g_EditRule(g_rule[idx].dll_id, nr.process_name, nr.target_hosts,
+                               nr.target_ports, nr.target_domains, nr.protocol,
+                               nr.action, dll_cfg_id))
+                {
+                    if (nr.is_enabled != g_rule[idx].snap.is_enabled)
+                    {
+                        if (nr.is_enabled) g_EnableRule(g_rule[idx].dll_id);
+                        else               g_DisableRule(g_rule[idx].dll_id);
+                    }
+                    g_rule[idx].snap = nr;
+                    changes++;
+                    printf("  %s edit rule %-26s cfg=%u  %s%s\n", tag,
+                           nr.process_name, nr.proxy_config_id, action_name(nr.action),
+                           nr.is_enabled ? "" : "  [disabled]");
+                }
+                else
+                    fprintf(stderr, "  WARNING: edit rule (%s) failed\n", nr.process_name);
+            }
+        }
     }
 
-    return added;
+    // ── Deletions: rules first (they reference configs), then configs ────────
+    for (int j = g_rule_n - 1; j >= 0; j--)
+    {
+        if (g_rule[j].seen) continue;
+        g_DeleteRule(g_rule[j].dll_id);
+        printf("  %s del  rule %s\n", tag, g_rule[j].snap.process_name);
+        changes++;
+        g_rule[j] = g_rule[--g_rule_n];   // compact
+    }
+    for (int j = g_cfg_n - 1; j >= 0; j--)
+    {
+        if (g_cfg[j].seen) continue;
+        g_DeleteProxyConfig(g_cfg[j].dll_id);
+        printf("  %s del  config id=%u\n", tag, g_cfg[j].profile_id);
+        changes++;
+        g_cfg[j] = g_cfg[--g_cfg_n];      // compact
+    }
+
+    return changes;
 }
 
 // ── DLL loader ────────────────────────────────────────────────────────────────
@@ -549,6 +660,11 @@ static bool load_dll(void)
     LOAD_FN(pfnAddProxyConfig,        g_AddProxyConfig, "ProxyBridge_AddProxyConfig");
     LOAD_FN(pfnAddRule,               g_AddRule,        "ProxyBridge_AddRule");
     LOAD_FN(pfnDisableRule,           g_DisableRule,    "ProxyBridge_DisableRule");
+    LOAD_FN(pfnEnableRule,            g_EnableRule,     "ProxyBridge_EnableRule");
+    LOAD_FN(pfnEditProxyConfig,       g_EditProxyConfig, "ProxyBridge_EditProxyConfig");
+    LOAD_FN(pfnDeleteProxyConfig,     g_DeleteProxyConfig, "ProxyBridge_DeleteProxyConfig");
+    LOAD_FN(pfnEditRule,              g_EditRule,       "ProxyBridge_EditRule");
+    LOAD_FN(pfnDeleteRule,            g_DeleteRule,     "ProxyBridge_DeleteRule");
     LOAD_FN(pfnSetLogCallback,        g_SetLog,         "ProxyBridge_SetLogCallback");
     LOAD_FN(pfnSetConnectionCallback, g_SetConn,        "ProxyBridge_SetConnectionCallback");
     LOAD_FN(pfnSetLocalhostViaProxy,  g_SetLocalhost,   "ProxyBridge_SetLocalhostViaProxy");
@@ -987,12 +1103,12 @@ int main(int argc, char* argv[])
     g_SetLocalhost(prof.localhost_via_proxy);
     g_SetTraffic(prof.traffic_logging);
 
-    // ── Push proxy configs + rules into the engine (add-only) ─────────────────
+    // ── Push proxy configs + rules into the engine ────────────────────────────
     printf("\nApplying profile:\n");
-    apply_profile(&prof, true);
-    printf("  %d proxy config(s), %d rule(s) active.\n", g_id_map_n, g_applied_rule_n);
+    sync_profile(&prof, true);
+    printf("  %d proxy config(s), %d rule(s) active.\n", g_cfg_n, g_rule_n);
 
-    if (g_applied_rule_n == 0)
+    if (g_rule_n == 0)
     {
         fprintf(stderr, "ERROR: No rules could be applied.\n");
         if (g_Stop) g_Stop();
@@ -1049,13 +1165,12 @@ int main(int argc, char* argv[])
             continue;                // mid-write / invalid - keep old mtime, retry
 
         printf("Profile changed - reloading...\n");
-        int added = apply_profile(&prof2, false);
+        int changes = sync_profile(&prof2, false);
         last_write = fad.ftLastWriteTime;
-        if (added > 0)
-            printf("  %d new entr%s added live.\n\n", added, added == 1 ? "y" : "ies");
+        if (changes > 0)
+            printf("  %d change%s applied live.\n\n", changes, changes == 1 ? "" : "s");
         else
-            printf("  No new entries. (Editing or removing existing proxies/rules "
-                   "still needs a restart.)\n\n");
+            printf("  No changes.\n\n");
         fflush(stdout);   // flush now - this is a long-lived, mostly-idle process
     }
 
